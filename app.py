@@ -3,10 +3,10 @@ import requests
 import pandas as pd
 import re
 from io import StringIO
+import os
 
 # --- Configuration ---
-API_URL = "http://127.0.0.1:8000/chat"
-DATASETS_URL = "http://127.0.0.1:8000/datasets"
+API_URL = "http://127.0.0.1:8000"
 
 # --- Page Setup ---
 st.set_page_config(
@@ -14,131 +14,139 @@ st.set_page_config(
     page_icon="🤖",
     layout="wide"
 )
-st.title("🤖 AutoML Agent Chatbot")
 
 # --- Session State Initialization ---
 if "session_id" not in st.session_state:
     st.session_state.session_id = None
 if "messages" not in st.session_state:
     st.session_state.messages = []
-if "initial_datasets_loaded" not in st.session_state:
-    st.session_state.initial_datasets_loaded = False
-# NEW: State for managing views (chat vs. plot)
-if "view" not in st.session_state:
-    st.session_state.view = "chat"
-if "plot_to_show" not in st.session_state:
-    st.session_state.plot_to_show = None
+if "chat_active" not in st.session_state:
+    st.session_state.chat_active = False
 
 # --- Helper Functions ---
-def get_initial_datasets():
-    """Fetches the list of available datasets from the API."""
-    try:
-        response = requests.get(DATASETS_URL)
-        response.raise_for_status()
-        datasets = response.json()
-        formatted_list = "\n".join(datasets)
-        return f"Welcome! To get started, please load a dataset from the following list:\n\n{formatted_list}"
-    except requests.exceptions.RequestException:
-        return f"Error: Could not connect to the backend API at {API_URL}. Please ensure the FastAPI server is running."
-
-def handle_assistant_response(response_text):
-    """Parses the assistant's response for special content like plots or dataframes."""
-    content_to_display = {"role": "assistant"}
+def parse_assistant_response(response_text):
+    """
+    Parses the assistant's response to extract special components
+    like DataFrames or image paths.
+    """
+    plot_path = None
+    dataframe = None
     
     plot_path_match = re.search(r"`(plots/[^`]+\.png)`", response_text)
-    dataframe_match = re.search(r"```\n(.*?)```", response_text, re.DOTALL)
-
-    if plot_path_match:
-        path = plot_path_match.group(1)
-        # Instead of displaying, we store the path and create a button later
-        content_to_display["plot_path"] = path
+    if plot_path_match and os.path.exists(plot_path_match.group(1)):
+        plot_path = plot_path_match.group(1)
         response_text = re.sub(r"`(plots/[^`]+\.png)`", "", response_text)
 
+    dataframe_match = re.search(r"```\n(.*?)```", response_text, re.DOTALL)
     if dataframe_match:
         df_string = dataframe_match.group(1)
         try:
-            df = pd.read_csv(StringIO(df_string), sep='\s{2,}', engine='python')
-            content_to_display["dataframe"] = df.to_json()
-            response_text = re.sub(r"```.*```", "(DataFrame displayed below)", response_text, flags=re.DOTALL)
-        except Exception:
+            # Use pandas to read the string as if it were a file
+            # This regex helps handle the index column that pandas.to_string() creates
+            df_string_cleaned = re.sub(r'^\s*\d+\s', '', df_string, flags=re.MULTILINE)
+            df = pd.read_csv(StringIO(df_string_cleaned), sep='\s{2,}', engine='python')
+            dataframe = df
+            response_text = re.sub(r"```.*```", "\n*Result displayed below.*", response_text, flags=re.DOTALL)
+        except Exception as e:
+            st.warning(f"Could not parse DataFrame from text: {e}")
             pass
             
-    content_to_display["content"] = response_text.strip()
-    return content_to_display
+    return response_text.strip(), dataframe, plot_path
 
-def show_plot_view():
-    """Displays the dedicated view for a single plot."""
-    st.header("Plot Viewer")
+def start_new_chat():
+    """Resets the session state to start a new conversation."""
+    st.session_state.session_id = None
+    st.session_state.messages = []
+    st.session_state.chat_active = False
+
+# --- Sidebar for Session Control ---
+with st.sidebar:
+    st.title("AutoML Agent")
+    st.markdown("---")
     
-    if st.button("⬅️ Back to Chat"):
-        st.session_state.view = "chat"
+    if st.button("➕ New Chat"):
+        start_new_chat()
         st.rerun()
 
-    if st.session_state.plot_to_show:
+    st.markdown("### 1. Start a New Session")
+    uploaded_file = st.file_uploader(
+        "Upload your CSV Dataset", 
+        type="csv",
+        on_change=start_new_chat 
+    )
+
+# --- Main Chat Interface ---
+st.header("🤖 AutoML Chatbot")
+
+# Handle file upload to start a session
+if uploaded_file is not None and not st.session_state.chat_active:
+    with st.spinner("Uploading and processing dataset..."):
         try:
-            st.image(st.session_state.plot_to_show, use_column_width=True)
-        except Exception as e:
-            st.error(f"Could not display image at {st.session_state.plot_to_show}: {e}")
-    else:
-        st.warning("No plot to display.")
-
-def show_chat_view():
-    """Displays the main chat interface."""
-    # Display the chat history
-    for i, message in enumerate(st.session_state.messages):
-        with st.chat_message(message["role"]):
-            if "dataframe" in message:
-                st.dataframe(pd.read_json(message["dataframe"]))
+            files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "text/csv")}
+            response = requests.post(f"{API_URL}/upload", files=files)
+            response.raise_for_status()
             
-            # NEW: If a message has a plot path, show a button
-            if "plot_path" in message:
-                if st.button(f"View Plot: {message['plot_path']}", key=f"plot_btn_{i}"):
-                    st.session_state.plot_to_show = message["plot_path"]
-                    st.session_state.view = "plot"
-                    st.rerun()
+            data = response.json()
+            st.session_state.session_id = data["session_id"]
             
-            st.markdown(message["content"])
+            # --- KEY FIX ---
+            # Manually construct the full message with the data preview
+            # wrapped in markdown code blocks so our parser can find it.
+            full_welcome_message = f"{data['message']}\n\n**Data Preview:**\n```\n{data['data_preview']}\n```"
+            
+            text_res, df_res, _ = parse_assistant_response(full_welcome_message)
+            
+            initial_message = {"role": "assistant", "content": text_res}
+            if df_res is not None:
+                initial_message["dataframe"] = df_res
+                
+            st.session_state.messages.append(initial_message)
+            st.session_state.chat_active = True
+            st.rerun()
 
-    # Get user input
-    if prompt := st.chat_input("What would you like to do?"):
+        except requests.exceptions.RequestException as e:
+            st.error(f"Error uploading file: {e}")
+
+# Display the entire chat history
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+        if message.get("dataframe") is not None:
+            st.dataframe(message["dataframe"])
+        if message.get("plot_path") is not None:
+            st.image(message["plot_path"])
+
+# Get new user input
+if st.session_state.chat_active:
+    if prompt := st.chat_input("Describe your ML goal or next step..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         
-        with st.spinner("Thinking..."):
-            try:
-                payload = {
-                    "session_id": st.session_state.session_id,
-                    "user_query": prompt
-                }
-                response = requests.post(API_URL, json=payload)
-                response.raise_for_status()
-                
-                data = response.json()
-                st.session_state.session_id = data["session_id"]
-                
-                assistant_message = handle_assistant_response(data["assistant_message"])
-                st.session_state.messages.append(assistant_message)
-                
-                st.rerun()
+        with st.chat_message("user"):
+            st.markdown(prompt)
 
-            except requests.exceptions.RequestException as e:
-                error_message = f"Error connecting to the backend: {e}"
-                st.error(error_message)
-                st.session_state.messages.append({"role": "assistant", "content": error_message})
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                try:
+                    payload = {"session_id": st.session_state.session_id, "user_query": prompt}
+                    response = requests.post(f"{API_URL}/chat", json=payload)
+                    response.raise_for_status()
+                    
+                    data = response.json()
+                    
+                    text_res, df_res, plot_res = parse_assistant_response(data["assistant_message"])
+                    
+                    assistant_response = {"role": "assistant", "content": text_res}
+                    if df_res is not None:
+                        assistant_response["dataframe"] = df_res
+                    if plot_res is not None:
+                        assistant_response["plot_path"] = plot_res
+                        
+                    st.session_state.messages.append(assistant_response)
+                    st.rerun()
 
-# --- Main App Logic ---
-
-# Load initial datasets message only once
-if not st.session_state.initial_datasets_loaded:
-    welcome_message = get_initial_datasets()
-    if "Error" not in welcome_message:
-        st.session_state.messages.append({"role": "assistant", "content": welcome_message})
-        st.session_state.initial_datasets_loaded = True
-    else:
-        st.error(welcome_message)
-
-
-# Router to show either the chat or the plot view
-if st.session_state.view == "plot":
-    show_plot_view()
+                except requests.exceptions.RequestException as e:
+                    error_message = f"Error connecting to the backend: {e}"
+                    st.error(error_message)
+                    st.session_state.messages.append({"role": "assistant", "content": error_message})
 else:
-    show_chat_view()
+    st.info("Please upload a CSV file in the sidebar to start a new chat session.")
