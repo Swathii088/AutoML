@@ -1,11 +1,10 @@
 import logging
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, File, UploadFile
 from pydantic import BaseModel
 from typing import Dict, Any, List
 import uuid
 import pandas as pd
-
-# --- Import your project's core components ---
+import io
 from state.graph_state import MLState
 from agent.router import get_routing_decision
 from tools.load_dataset_tool import load_dataset_tool, list_available_datasets
@@ -14,8 +13,6 @@ from llm.task_identifier_nodes import (
     request_confirmation_node,
     handle_validation_node,
 )
-
-# --- Import All Tool Logic Functions ---
 from tools.setup_tool import setup_tool
 from tools.compare_models_tool import compare_models_tool
 from tools.create_model_tool import  create_model_tool
@@ -32,6 +29,7 @@ from tools.data_analysis_tool import (
     missing_values_tool,
     correlation_analysis_tool,
 )
+from tools.show_model_tool import show_model_tool
 from tools.plot_tool import plot_model_tool
 
 # --- Configure logging ---
@@ -45,20 +43,23 @@ app = FastAPI(
 )
 
 # --- In-Memory Session Storage ---
-# For local testing, a simple dictionary is perfect to store session states.
 sessions: Dict[str, MLState] = {}
 
 # --- Pydantic Models for API Requests/Responses ---
 class ChatRequest(BaseModel):
-    session_id: str | None = None
+    session_id: str # Session ID is now required for chat
     user_query: str
 
 class ChatResponse(BaseModel):
     session_id: str
     assistant_message: str
-    state_summary: Dict[str, Any] # A JSON-safe summary of the state
 
-# --- Helper Function to Create a Serializable State Summary ---
+class UploadResponse(BaseModel):
+    session_id: str
+    filename: str
+    message: str
+    data_preview: str # A JSON-safe summary of the state
+
 def create_serializable_state_summary(state: MLState) -> Dict[str, Any]:
     """
     Creates a JSON-safe dictionary summary of the MLState, excluding complex objects.
@@ -96,37 +97,82 @@ tool_map = {
     "save_model_tool": save_model_tool,
     "load_model_tool": load_model_tool,
     "assign_model_tool": assign_model_tool_logic,
+    "show_model_tool": show_model_tool,
 }
 
 # --- API Endpoints ---
 
 @app.get("/")
 def read_root():
-    return {"message": "Welcome to the AutoML Agent API. Use the /chat endpoint to interact."}
+    return {"message": "Welcome to the AutoML Agent API."}
+
+@app.post("/upload", response_model=UploadResponse)
+async def upload_dataset(file: UploadFile = File(...)):
+    """
+    Handles CSV file uploads, creates a new session, and stores the data.
+    """
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="Invalid file type. Please upload a CSV file.")
+    
+    try:
+        contents = await file.read()
+        df = pd.read_csv(io.BytesIO(contents))
+
+        # Create a new session for this uploaded file
+        session_id = str(uuid.uuid4())
+        state = MLState(input_message="", data=df)
+        sessions[session_id] = state
+
+        logger.info(f"New session {session_id} created for file {file.filename}")
+
+        return UploadResponse(
+            session_id=session_id,
+            filename=file.filename,
+            message=f"✅ Dataset '{file.filename}' loaded successfully! Shape: {df.shape}. You can now describe your ML goal.",
+            data_preview=df.head().to_string()
+        )
+    except Exception as e:
+        logger.error(f"Failed to process uploaded file: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to process file: {e}")
+
 
 @app.post("/chat", response_model=ChatResponse)
 def chat_with_agent(request: ChatRequest):
     """
-    Main endpoint for interacting with the AutoML agent.
+    Main endpoint for interacting with the AutoML agent for an existing session.
     """
-    session_id = request.session_id or str(uuid.uuid4())
-    state = sessions.get(session_id, MLState(input_message=""))
+    session_id = request.session_id
+    state = sessions.get(session_id)
+
+    if not state:
+        raise HTTPException(status_code=404, detail="Session not found. Please upload a dataset first.")
+
     user_query = request.user_query
     
-    # --- Onboarding & Main Logic ---
-    if state.data is None:
-        updates = load_dataset_tool.invoke({"state": state, "user_query": f"load {user_query}"})
-        state = state.model_copy(update=updates)
-    elif state.task is None:
+    # --- Simplified and Corrected Onboarding & Main Logic ---
+    
+    # State 1: No task has been identified yet.
+    if state.task is None:
         state.input_message = user_query
         updates = identify_task_node(state)
         state = state.model_copy(update=updates)
+        # Immediately ask for confirmation
         updates = request_confirmation_node(state)
         state = state.model_copy(update=updates)
-    elif not state.setup_done and state.task and state.user_validation_response is None:
+    
+    # State 2: A task has been proposed, and we are waiting for user validation.
+    elif state.user_validation_response is None:
          state.user_validation_response = user_query
          updates = handle_validation_node(state)
          state = state.model_copy(update=updates)
+         # If the user said "no", the response is now cleared so they can provide the correction.
+         if "Apologies" in state.last_output:
+             state.user_validation_response = None
+         # If the task was confirmed or corrected, clear the response for the next stage.
+         elif "✅" in state.last_output:
+             state.user_validation_response = "validated"
+
+    # State 3: Onboarding is complete, use the main router.
     else:
         decision = get_routing_decision(user_query)
         if not decision or "tool_name" not in decision:
@@ -143,15 +189,8 @@ def chat_with_agent(request: ChatRequest):
     # Save the updated state for the session
     sessions[session_id] = state
     
-    # Return the serializable summary
     return ChatResponse(
         session_id=session_id,
         assistant_message=state.last_output,
         state_summary=create_serializable_state_summary(state)
     )
-
-@app.get("/datasets")
-def get_datasets() -> List[str]:
-    """Endpoint to get the list of available datasets."""
-    # We call the underlying function, not the tool
-    return list_available_datasets().split('\n')
