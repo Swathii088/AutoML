@@ -98,18 +98,24 @@ def compare_models_tool(state: MLState, user_query: Optional[str] = None) -> Dic
         "classification": classification_pull,
         "regression": regression_pull
     }
-
     try:
-        # Dynamically call the correct compare_models function
         compare_function = compare_map[task]
-        best_model = compare_function(**config)
+        best_models = compare_function(**config)
+        
         leaderboard = pull_map[task]()
         
         logger.info("Model comparison successful. Leaderboard retrieved.")
         
+        # --- KEY FIX ---
+        # Use the 'n_select' value to show only the top N models requested by the user.
+        top_n = config.get("n_select", 1)
+        leaderboard_preview = leaderboard.head(top_n).to_string()
+        
         return {
-            "best_model": best_model,
-            "last_output": f"✅ Model comparison complete. The best model has been selected.\n\n**Leaderboard:**\n```\n{leaderboard.to_string()}\n```"
+            "best_model": best_models,
+            "model": best_models, # Also update the active model reference
+            "leaderboard": leaderboard,
+            "last_output": f"✅ Model comparison complete. The best {top_n} model(s) have been selected.\n\n**Top {top_n} Models:**\n```\n{leaderboard_preview}\n```"
         }
     except Exception as e:
         logger.error(f"PyCaret compare_models failed: {e}", exc_info=True)

@@ -78,7 +78,7 @@ def load_dataset_tool(state: MLState, user_query: str) -> Dict[str, Any]:
         data = get_data(dataset_name, verbose=True)
         logger.info(f"Successfully loaded dataset '{dataset_name}'.")
         
-        summary = f"✅ Dataset '{dataset_name}' loaded successfully! Shape: {data.shape}\n\n**Data Preview :**\n{data.head().to_dict}"
+        summary = f"✅ Dataset '{dataset_name}' loaded successfully! Shape: {data.shape}"
 
         return {
             "data": data,

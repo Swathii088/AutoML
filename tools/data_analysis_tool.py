@@ -2,26 +2,53 @@ import logging
 import pandas as pd
 import numpy as np
 from typing import Dict, Any
+
 from langchain_core.tools import tool
 from state.graph_state import MLState
+
+# Import the specific pull functions from each PyCaret module
+from pycaret.classification import pull as classification_pull
+from pycaret.regression import pull as regression_pull
+from pycaret.clustering import pull as clustering_pull
+from pycaret.anomaly import pull as anomaly_pull
 
 # --- Configure logging ---
 logger = logging.getLogger(__name__)
 
+# --- NEW: Helper function to get the correct data (raw vs. transformed) ---
+def _get_active_dataframe(state: MLState) -> pd.DataFrame | None:
+    """
+    Returns the transformed dataframe if setup is complete, otherwise returns
+    the original raw dataframe.
+    """
+    if state.setup_done:
+        logger.info("Setup is complete. Pulling transformed data for analysis.")
+        pull_map = {
+            "classification": classification_pull,
+            "regression": regression_pull,
+            "clustering": clustering_pull,
+            "anomaly": anomaly_pull,
+        }
+        pull_function = pull_map.get(state.task)
+        if pull_function:
+            # The pull() function with no arguments returns the transformed dataset
+            return pull_function()
+    
+    logger.info("Setup not complete. Using original raw data for analysis.")
+    return state.data
 
-# --- Tool 1: Descriptive Statistics ---
+# --- Tool 1: Descriptive Statistics (Updated) ---
 @tool("descriptive_statistics_tool")
 def descriptive_statistics_tool(state: MLState) -> Dict[str, Any]:
     """
-    Calculates and displays descriptive statistics for the loaded dataset.
-    This includes count, mean, standard deviation, min, max, and quartiles for
-    numeric columns and value counts for categorical columns.
+    Calculates and displays descriptive statistics for the current dataset.
+    If setup has been run, it analyzes the transformed data.
     """
     logger.info("--- Executing Descriptive Statistics Tool ---")
     
-    data = state.data
+    data = _get_active_dataframe(state) # Use the helper function
     if data is None:
-        return {"last_output": "❌ No data loaded. Please load a dataset first."}
+        return {"last_output": "❌ No data available for analysis."}
 
     try:
         numeric_summary = data.select_dtypes(include=np.number).describe().to_string()
@@ -36,18 +63,18 @@ def descriptive_statistics_tool(state: MLState) -> Dict[str, Any]:
         return {"last_output": f"❌ An error occurred while generating statistics: {e}"}
 
 
-# --- Tool 2: Missing Values Analysis ---
+# --- Tool 2: Missing Values Analysis (Updated) ---
 @tool("missing_values_tool")
 def missing_values_tool(state: MLState) -> Dict[str, Any]:
     """
-    Analyzes and reports the number and percentage of missing values for each
-    column in the loaded dataset.
+    Analyzes and reports missing values for the current dataset.
+    If setup has been run, it analyzes the transformed data.
     """
     logger.info("--- Executing Missing Values Tool ---")
     
-    data = state.data
+    data = _get_active_dataframe(state) # Use the helper function
     if data is None:
-        return {"last_output": "❌ No data loaded. Please load a dataset first."}
+        return {"last_output": "❌ No data available for analysis."}
 
     try:
         missing_counts = data.isnull().sum()
@@ -71,18 +98,18 @@ def missing_values_tool(state: MLState) -> Dict[str, Any]:
         return {"last_output": f"❌ An error occurred while analyzing missing values: {e}"}
 
 
-# --- Tool 3: Correlation Analysis ---
+# --- Tool 3: Correlation Analysis (Updated) ---
 @tool("correlation_analysis_tool")
 def correlation_analysis_tool(state: MLState) -> Dict[str, Any]:
     """
-    Computes the correlation matrix for numeric variables and identifies pairs
-    with a high correlation coefficient (absolute value > 0.8).
+    Computes the correlation matrix for the current dataset's numeric variables.
+    If setup has been run, it analyzes the transformed data.
     """
     logger.info("--- Executing Correlation Analysis Tool ---")
     
-    data = state.data
+    data = _get_active_dataframe(state) # Use the helper function
     if data is None:
-        return {"last_output": "❌ No data loaded. Please load a dataset first."}
+        return {"last_output": "❌ No data available for analysis."}
 
     try:
         numeric_data = data.select_dtypes(include=np.number)
@@ -107,8 +134,9 @@ def correlation_analysis_tool(state: MLState) -> Dict[str, Any]:
 ---
 
 ### Full Correlation Matrix
+```
 {corr_matrix.to_string()}
-
+```
 """
         return {"last_output": full_report}
 
